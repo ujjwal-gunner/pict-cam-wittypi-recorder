@@ -6,9 +6,9 @@ Records video with legacy PiCamera until 1 min before WittyPi shutdown. Stops RP
 
 ```bash
 cd ~
-wget <release-zip-url>
+wget https://github.com/ujjwal-gunner/pict-cam-wittypi-recorder/archive/refs/heads/main.zip -O pict-cam-wittypi-recorder.zip
 unzip pict-cam-wittypi-recorder.zip
-cd pict-cam-wittypi-recorder
+cd pict-cam-wittypi-recorder-main
 chmod +x install.sh uninstall.sh
 ./install.sh
 ```
