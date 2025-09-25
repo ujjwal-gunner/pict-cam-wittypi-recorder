@@ -31,7 +31,7 @@ Provides a lightweight **web interface** to control recording, manage files, vie
 
 ```bash
 cd ~
-wget https://github.com/<youruser>/pict-cam-wittypi-recorder/archive/refs/heads/main.zip -O pict-cam-wittypi-recorder.zip
+wget https://github.com/ujjwal-gunner/pict-cam-wittypi-recorder/archive/refs/heads/main.zip -O pict-cam-wittypi-recorder.zip
 unzip pict-cam-wittypi-recorder.zip
 mv pict-cam-wittypi-recorder-main pict-cam-wittypi-recorder
 cd pict-cam-wittypi-recorder
