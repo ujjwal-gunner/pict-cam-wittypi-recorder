@@ -42,8 +42,8 @@ CAMERA_CONFIG = {
 
 # MODE SWITCH:
 #   - Set DURATION_SECONDS = None --> Witty Pi mode (wait/record until 1 min before next shutdown)
-#   - Set DURATION_SECONDS = N (int, 1..18000) --> Fixed-duration mode (record for N seconds)
-DURATION_SECONDS = None  # e.g., 600 for 10 minutes; must be <= 18000 to be used
+#   - Set DURATION_SECONDS = N (int, 1..3600) --> Fixed-duration mode (record for N seconds)
+DURATION_SECONDS = None  # e.g., 600 for 10 minutes; must be <= 3600 to be used
 
 RECORDINGS_DIR = Path.home() / "recordings"
 WITTYPI_DIR_CANDIDATES = [Path.home() / "wittypi", Path("/home/pi/wittypi"), Path("/home/pi/WittyPi")]
@@ -174,7 +174,6 @@ def get_next_shutdown_from_wittypi():
 def schedule_path():
     return _find_existing(SCHEDULE_FILE_CANDIDATES) or SCHEDULE_FILE_CANDIDATES[0]
 
-# ------------- System Info Panel -------------
 def system_info_html():
     try:
         du = shutil.disk_usage("/")
@@ -190,14 +189,23 @@ def system_info_html():
         cpu_str = f"{psutil.cpu_percent(interval=0.5)} %"
     except Exception:
         cpu_str = "N/A"
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            temp_c = int(f.read().strip()) / 1000
+        temp_str = f"{temp_c:.1f} °C"
+    except Exception:
+        temp_str = "N/A"
+
     return f"""
 <h3>System Info</h3>
 <table border='1' cellspacing='0' cellpadding='6'>
 <tr><td>Disk</td><td>{disk_str}</td></tr>
 <tr><td>RAM</td><td>{ram_str}</td></tr>
 <tr><td>CPU</td><td>{cpu_str}</td></tr>
+<tr><td>Temp</td><td>{temp_str}</td></tr>
 </table>
 """
+
 
 
 # ------------- RPi Cam Web Interface -------------
@@ -405,6 +413,10 @@ def worker_wittypi_loop():
             remain = _seconds_until(next_shutdown)
             if remain > SAFETY_MARGIN_SECONDS + 5:
                 stop_at = next_shutdown - timedelta(seconds=SAFETY_MARGIN_SECONDS)
+                # Cap maximum recording duration to 1 hour
+                max_stop_at = _now_local() + timedelta(seconds=3600)
+                if stop_at > max_stop_at:
+                    stop_at = max_stop_at
                 with state_lock:
                     state["mode"] = "recording_wittypi"
                 record_stop_event.clear()
@@ -513,7 +525,6 @@ class UIHandler(http.server.BaseHTTPRequestHandler):
 <head>
 <meta charset="utf-8">
 <title>PICT Recorder</title>
-<meta http-equiv="refresh" content="10">
 </head>
 <body>
 <h2>PICT Recorder</h2>
@@ -521,7 +532,7 @@ class UIHandler(http.server.BaseHTTPRequestHandler):
 
 <h3>Controls</h3>
 <form method="POST" action="/start_duration" style="margin-bottom:8px;">
-Start duration (1..18000 s): <input name="seconds" size="8"/>
+Start duration (1..3600 s): <input name="seconds" size="8"/>
 <button type="submit">Start</button>
 </form>
 <form method="POST" action="/start_wittypi" style="display:inline;">
@@ -647,10 +658,10 @@ Start duration (1..18000 s): <input name="seconds" size="8"/>
             sec_str = fields.get("seconds", [""])[0].strip()
             try:
                 sec = int(sec_str)
-                if not (1 <= sec <= 18000):
+                if not (1 <= sec <= 3600):
                     raise ValueError()
             except Exception:
-                self.send_error(400, "seconds must be integer 1..18000")
+                self.send_error(400, "seconds must be integer 1..3600")
             else:
                 with state_lock:
                     already = state["recording"]
@@ -699,7 +710,7 @@ def main():
     log("PICT recorder starting...")
     threading.Thread(target=serve_http, daemon=True).start()
 
-    if isinstance(DURATION_SECONDS, int) and 1 <= DURATION_SECONDS <= 18000:
+    if isinstance(DURATION_SECONDS, int) and 1 <= DURATION_SECONDS <= 3600:
         threading.Thread(target=worker_duration_once, args=(DURATION_SECONDS,), daemon=True).start()
     else:
         threading.Thread(target=worker_wittypi_loop, daemon=True).start()
