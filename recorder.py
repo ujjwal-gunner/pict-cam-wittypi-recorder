@@ -485,6 +485,11 @@ def status_panel():
     err_str = f"<br/><span style='color:#a00;'>Last error: {html_escape(last_err)}</span>" if last_err else ""
     return f"<p><b>Status:</b> {html_escape(m)}{extras_str}{rem}{err_str}</p>"
 
+def datetime_html():
+    now_str = _now_local().strftime("%Y-%m-%d %H:%M:%S %Z")
+    return f"<h3>System Date & Time</h3><p>{now_str}</p>"
+
+
 def schedule_editor_html():
     sp = schedule_path()
     try:
@@ -529,6 +534,7 @@ class UIHandler(http.server.BaseHTTPRequestHandler):
 <body>
 <h2>PICT Recorder</h2>
 {status_panel()}
+{datetime_html()}
 
 <h3>Controls</h3>
 <form method="POST" action="/start_duration" style="margin-bottom:8px;">
@@ -704,8 +710,28 @@ def serve_http():
         except Exception as e:
             log(f"HTTP server stopped: {e}")
 
+def apply_low_power_settings():
+    import subprocess
+
+    # --- Disable HDMI ---
+    try:
+        subprocess.run(["/usr/bin/tvservice", "-o"], check=False)
+        with open("/sys/class/graphics/fb0/blank", "w") as f:
+            f.write("1")
+    except Exception as e:
+        log(f"HDMI disable failed: {e}")
+
+    # --- Disable Bluetooth ---
+    try:
+        subprocess.run(["rfkill", "block", "bluetooth"], check=False)
+        log("Bluetooth disabled")
+    except Exception as e:
+        log(f"Bluetooth disable failed: {e}")
+
+
 # ------------- Main -------------
 def main():
+    apply_low_power_settings()
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
     log("PICT recorder starting...")
     threading.Thread(target=serve_http, daemon=True).start()
