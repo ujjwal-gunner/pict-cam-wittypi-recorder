@@ -9,7 +9,7 @@ echo "[pict] Installing pict-cam-wittypi-recorder ..."
 mkdir -p "$HOME/recordings"
 
 sudo apt-get update
-sudo apt-get install -y python3 python3-picamera ffmpeg
+sudo apt-get install -y python3 python3-picamera2 python3-psutil ffmpeg
 
 SERVICE_FILE="/etc/systemd/system/$SERVICE_NAME"
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
