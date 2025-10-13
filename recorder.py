@@ -2,20 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-pict-cam-wittypi-recorder (full-feature build)
+pict-cam-wittypi-recorder (picamera2 / Bookworm)
 
 Web UI @ http://<pi>:8123
 - Status (Recording WittyPi / Recording Duration / Waiting / Idle) with remaining time
 - Controls: Start duration, Re-run WittyPi mode, Stop recording
 - Config table (resolution, fps, quality, mode, dirs, ports, etc.)
 - List / Download / Delete recordings
-- View/Edit schedule.wpi
+- View/Edit schedule.wpi (we only READ/WRT this file; WittyPi hardware optional)
 - Logs viewer (scrollable, multiline)
 - MJPEG Preview stream (/preview) when NOT recording (no storage)
 
 Camera handling:
-- Legacy picamera (PiCamera) with retry/open/close management
-- Annotation overlay updated every second (label | time | res | fps | quality | remaining)
+- picamera2 (libcamera) with retry/open/close management
+- Preview annotation overlay (label | time | res | fps | bitrate | remaining) drawn with Pillow
 - Stops RPi Cam Web Interface (no sudo): tries stop.sh and pkill raspimjpeg
 - Keeps service alive after each recording (never exits on its own)
 """
@@ -26,23 +26,29 @@ from pathlib import Path
 from collections import deque
 import shutil, psutil
 import socket
+from io import BytesIO
+
+# === picamera2 imports ===
+from picamera2 import Picamera2
+from picamera2.encoders import H264Encoder, MJPEGEncoder
+from picamera2.outputs import FileOutput
+from PIL import Image, ImageDraw, ImageFont
+
 HOSTNAME = socket.gethostname()
 
 # =========================
 # CAMERA / RUNTIME CONFIG
 # =========================
 CAMERA_CONFIG = {
-    "resolution": (1296, 972),     # width, height
-    "framerate": 15,               # FPS
-    "bitrate": 4_000_000,          # bits per second (single quality knob), currently not used in code.
-    "quality": 22,
+    "resolution": (1296, 972),     # width, height (choose a mode your sensor supports well)
+    "framerate": 15,               # FPS (we set FrameDurationLimits)
+    "bitrate": 4_000_000,          # bits per second (single quality knob, used for H.264 encoder)
+    "quality": 22,                 # retained only for UI display
     "annotation_label": "PICT WittyPi Recorder",
     "file_extension": ".h264",     # raw H.264 (mp4 wrap optional via ffmpeg)
 }
 
 # MODE SWITCH:
-#   - Set DURATION_SECONDS = None --> Witty Pi mode (wait/record until 1 min before next shutdown)
-#   - Set DURATION_SECONDS = N (int, 1..3600) --> Fixed-duration mode (record for N seconds)
 DURATION_SECONDS = None  # e.g., 600 for 10 minutes; must be <= 3600 to be used
 
 RECORDINGS_DIR = Path.home() / "recordings"
@@ -50,23 +56,23 @@ WITTYPI_DIR_CANDIDATES = [Path.home() / "wittypi", Path("/home/pi/wittypi"), Pat
 RUNSCRIPT_CANDIDATES   = [d / "runScript.sh" for d in WITTYPI_DIR_CANDIDATES]
 SCHEDULE_FILE_CANDIDATES = [d / "schedule.wpi" for d in WITTYPI_DIR_CANDIDATES]
 
-SAFETY_MARGIN_SECONDS  = 60         # stop 1 minute before Witty Pi shutdown
-CHECK_INTERVAL         = 30         # poll Witty Pi every N seconds
-WEB_PORT               = 8123       # HTTP server port
+SAFETY_MARGIN_SECONDS  = 60
+CHECK_INTERVAL         = 30
+WEB_PORT               = 8123
 
-# RPi Cam Web Interface stop options (no sudo usage)
 RPICAM_STOP_CANDIDATES = [
     ["/home/pi/RPi_Cam_Web_Interface/stop.sh"],
     ["/var/www/html/RPi_Cam_Web_Interface/stop.sh"],
 ]
-RPICAM_SERVICE_NAMES = ["raspimjpeg"]  # we'll pkill instead of systemctl to avoid sudo
+RPICAM_SERVICE_NAMES = ["raspimjpeg"]
 
 # ------------- Logging -------------
 LOG_PATH = RECORDINGS_DIR / "recorder.log"
-LOG_MAX = 1000   # keep last 1000 lines
+LOG_MAX = 1000
 LOG = deque(maxlen=LOG_MAX)
 def log(msg: str):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    from datetime import datetime as _dt
+    ts = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}"
     print(line, flush=True)
     LOG.append(line)
@@ -74,24 +80,20 @@ def log(msg: str):
         LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with LOG_PATH.open("a") as f:
             f.write(line + "\n")
-        # truncate file to last LOG_MAX lines
         with LOG_PATH.open("r+") as f:
             lines = f.readlines()
             if len(lines) > LOG_MAX:
-                f.seek(0)
-                f.writelines(lines[-LOG_MAX:])
-                f.truncate()
+                f.seek(0); f.writelines(lines[-LOG_MAX:]); f.truncate()
     except Exception:
         pass
-
 
 # ------------- Global State -------------
 state_lock = threading.Lock()
 state = {
     "mode": "idle",                 # idle | waiting | recording_duration | recording_wittypi
     "recording": False,
-    "record_start": None,           # datetime
-    "record_stop_target": None,     # datetime
+    "record_start": None,
+    "record_stop_target": None,
     "last_error": "",
     "preview_on": False,
 }
@@ -131,7 +133,7 @@ def wrap_to_mp4(h264_file: Path):
     try:
         subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
     except Exception:
-        log("ffmpeg not found; skipping mp4 wrap")
+        log("ffmpeg not found (or slow); skipping mp4 wrap")
         return
     mp4_file = h264_file.with_suffix(".mp4")
     try:
@@ -143,18 +145,12 @@ def wrap_to_mp4(h264_file: Path):
             str(mp4_file)
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         log(f"Wrapped {h264_file.name} -> {mp4_file.name}")
-        # ✅ Delete the .h264 after success
         h264_file.unlink(missing_ok=True)
     except Exception as e:
         log(f"MP4 wrap failed: {e}")
 
-
 # ------------- Witty Pi -------------
 def get_next_shutdown_from_wittypi():
-    """
-    Use Witty Pi's runScript.sh output to obtain 'Next shutdown at:'.
-    Returns tz-aware datetime or None.
-    """
     runscript = _find_existing(RUNSCRIPT_CANDIDATES)
     if not runscript:
         return None
@@ -206,18 +202,14 @@ def system_info_html():
 </table>
 """
 
-
-
 # ------------- RPi Cam Web Interface -------------
 def stop_rpi_cam_interface():
-    # Try stop.sh scripts (many installs work without sudo)
     for cmd in RPICAM_STOP_CANDIDATES:
         try:
             if Path(cmd[0]).exists():
                 subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-    # Kill raspimjpeg if still running (no sudo)
     for name in RPICAM_SERVICE_NAMES:
         try:
             subprocess.run(["/usr/bin/pkill", "-f", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -225,71 +217,109 @@ def stop_rpi_cam_interface():
             pass
     log("RPi Cam Web Interface stop attempted (stop.sh/pkill).")
 
-# ------------- Camera Manager -------------
+# ------------- Camera Manager (picamera2) -------------
 class CameraManager:
     """
-    Manages a single PiCamera instance with retry, overlay and preview helpers.
+    Manages a single Picamera2 instance with retry and preview helpers.
+    - Recording: H.264 via encoder (bitrate = CAMERA_CONFIG['bitrate'])
+    - Preview: MJPEG multipart stream; frames annotated via Pillow (not embedded in .h264)
     """
     def __init__(self):
         self.cam = None
         self.lock = threading.Lock()
         self.preview_thread = None
         self.preview_stop = threading.Event()
+        self.encoder = None
+        self._font = None  # Pillow font cache
 
-    def open_with_retry(self, attempts=4, delay=2.0):
+    def _ensure_font(self, height):
+        if self._font:
+            return self._font
+        try:
+            # Use a default bitmap font; avoids shipping TTF
+            self._font = ImageFont.load_default()
+        except Exception:
+            self._font = None
+        return self._font
+
+    def _configure_video(self, pc2: Picamera2):
+        width, height = CAMERA_CONFIG["resolution"]
+        fps = CAMERA_CONFIG["framerate"]
+        frame_time_us = int(1_000_000 / max(1, fps))
+        config = pc2.create_video_configuration(
+            main={"size": (width, height), "format": "YUV420"},
+            controls={"FrameDurationLimits": (frame_time_us, frame_time_us)}
+        )
+        pc2.configure(config)
+
+    def _configure_preview(self, pc2: Picamera2):
+        width, height = CAMERA_CONFIG["resolution"]
+        fps = CAMERA_CONFIG["framerate"]
+        frame_time_us = int(1_000_000 / max(1, fps))
+        config = pc2.create_preview_configuration(
+            main={"size": (width, height), "format": "RGB888"},
+            controls={"FrameDurationLimits": (frame_time_us, frame_time_us)}
+        )
+        pc2.configure(config)
+
+    def open_with_retry(self, attempts=4, delay=2.0, for_preview=False):
         with self.lock:
             if self.cam is not None:
                 return True
+            last_err = None
             for i in range(1, attempts+1):
                 try:
-                    from picamera import PiCamera
-                    self.cam = PiCamera(resolution=CAMERA_CONFIG["resolution"])
-                    self.cam.framerate = CAMERA_CONFIG["framerate"]
-                    log("Camera opened")
+                    pc2 = Picamera2()
+                    if for_preview:
+                        self._configure_preview(pc2)
+                    else:
+                        self._configure_video(pc2)
+                    self.cam = pc2
+                    log("Camera opened (picamera2)")
                     return True
                 except Exception as e:
+                    last_err = e
                     log(f"Camera open failed (attempt {i}/{attempts}): {e}")
                     time.sleep(delay)
             with state_lock:
-                state["last_error"] = "Cannot open camera (MMAL/ENOMEM or busy)."
+                state["last_error"] = f"Cannot open camera (libcamera busy?): {last_err}"
             return False
 
     def close(self):
         with self.lock:
             try:
                 if self.cam:
+                    try:
+                        # If recording, stop gracefully
+                        try:
+                            self.cam.stop_recording()
+                        except Exception:
+                            pass
+                        self.cam.stop()
+                    except Exception:
+                        pass
                     self.cam.close()
                     log("Camera closed")
             except Exception:
                 pass
             self.cam = None
+            self.encoder = None
 
-    def set_overlay(self, text: str):
-        with self.lock:
-            if self.cam:
-                try:
-                    self.cam.annotate_text = text
-                except Exception:
-                    pass
-
+    # Recording
     def start_recording(self, path: Path):
         with self.lock:
             if not self.cam:
                 return False
             try:
-                self.cam.start_recording(str(path), quality=CAMERA_CONFIG["quality"])
+                # Ensure video configuration (we might have been in preview previously)
+                self._configure_video(self.cam)
+                # Start camera and encoder
+                self.encoder = H264Encoder(bitrate=CAMERA_CONFIG["bitrate"])
+                self.cam.start_recording(self.encoder, FileOutput(str(path)))
                 return True
             except Exception as e:
                 log(f"start_recording error: {e}")
                 return False
-
-    def wait_recording(self, sec=1.0):
-        with self.lock:
-            if self.cam:
-                try:
-                    self.cam.wait_recording(sec)
-                except Exception as e:
-                    log(f"wait_recording error: {e}")
 
     def stop_recording(self):
         with self.lock:
@@ -300,6 +330,37 @@ class CameraManager:
                     pass
 
     # ---- MJPEG Preview (no storage) ----
+    def _draw_annotation(self, im: Image.Image, text: str):
+        try:
+            draw = ImageDraw.Draw(im)
+            font = self._ensure_font(im.height)
+            # simple black box background
+            margin = 6
+            lines = text.split("\n")
+            # measure
+            maxw = 0
+            lh = 0
+            for line in lines:
+                sz = draw.textbbox((0,0), line, font=font)
+                w = sz[2]-sz[0]; h = sz[3]-sz[1]
+                maxw = max(maxw, w); lh = max(lh, h)
+            box_h = lh * len(lines) + margin*2
+            box_w = maxw + margin*2
+            draw.rectangle([0, 0, box_w, box_h], fill=(0,0,0,160))
+            y = margin
+            for line in lines:
+                draw.text((margin, y), line, fill=(255,255,255), font=font)
+                y += lh
+        except Exception:
+            pass
+        return im
+
+    def _capture_jpeg_bytes(self):
+        buf = BytesIO()
+        # capture_file works when camera is started with preview/still config
+        self.cam.capture_file(buf, format='jpeg')
+        return buf.getvalue()
+
     def _mjpeg_streamer(self, wfile):
         """
         Start a MJPEG stream and write frames to wfile as multipart.
@@ -310,23 +371,19 @@ class CameraManager:
             def __init__(self, out): self.out = out
             def write(self, b):
                 try:
-                    self.out.write(self.boundary)
-                    self.out.write(b)
-                    self.out.write(b"\r\n")
+                    self.out.write(self.boundary); self.out.write(b); self.out.write(b"\r\n")
                 except Exception:
                     pass
             def flush(self): pass
 
-        if not self.open_with_retry():
+        if not self.open_with_retry(for_preview=True):
             try: wfile.write(b"")
             except Exception: pass
             return
 
-        writer = _FrameWriter(wfile)
-
         with self.lock:
             try:
-                self.cam.start_recording(writer, format='mjpeg')
+                self.cam.start()
             except Exception as e:
                 log(f"Preview start error: {e}")
                 return
@@ -336,14 +393,41 @@ class CameraManager:
         self.preview_stop.clear()
         log("Preview started")
 
+        writer = _FrameWriter(wfile)
+
         try:
             while not self.preview_stop.is_set():
-                self.wait_recording(0.2)
+                # Build frame with overlay text
+                remaining = 0
+                with state_lock:
+                    if state["record_stop_target"]:
+                        remaining = int(max(0, _seconds_until(state["record_stop_target"])))
+                text = (
+                    f"{CAMERA_CONFIG['annotation_label']} ({HOSTNAME})\n"
+                    f"{_now_local().strftime('%Y-%m-%d %H:%M:%S')} | "
+                    f"{CAMERA_CONFIG['resolution'][0]}x{CAMERA_CONFIG['resolution'][1]} @ "
+                    f"{CAMERA_CONFIG['framerate']}fps | "
+                    f"~{int(CAMERA_CONFIG['bitrate']/1e6)}Mbps | rem {remaining}s"
+                )
+
+                # Grab a JPEG and draw annotation
+                try:
+                    jpg = self._capture_jpeg_bytes()
+                    im = Image.open(BytesIO(jpg)).convert("RGB")
+                    im = self._draw_annotation(im, text)
+                    out = BytesIO()
+                    im.save(out, format="JPEG", quality=80)
+                    writer.write(out.getvalue())
+                except Exception as e:
+                    log(f"Preview frame error: {e}")
+                    time.sleep(0.2)
+                    continue
+
+                time.sleep(0.2)
         finally:
             with self.lock:
                 try:
-                    if self.cam:
-                        self.cam.stop_recording()
+                    self.cam.stop()
                 except Exception:
                     pass
             with state_lock:
@@ -364,6 +448,7 @@ CAM = CameraManager()
 
 # ------------- Recording -------------
 def annotate(rem_s: int):
+    # (Used only for preview text; we keep this helper for formatting)
     return (
         f"{CAMERA_CONFIG['annotation_label']} ({HOSTNAME})\n"
         f"{_now_local().strftime('%Y-%m-%d %H:%M:%S')} | "
@@ -379,7 +464,8 @@ def do_record_until(stop_at: datetime):
         log("Cannot open camera; aborting recording.")
         return
 
-    if not CAM.start_recording(out_path):
+    started = CAM.start_recording(out_path)
+    if not started:
         log("start_recording failed; aborting.")
         return
 
@@ -390,15 +476,14 @@ def do_record_until(stop_at: datetime):
 
     try:
         while not record_stop_event.is_set() and _seconds_until(stop_at) > 0:
-            rem = int(max(0, _seconds_until(stop_at)))
-            CAM.set_overlay(annotate(rem))
-            CAM.wait_recording(1.0)
+            # picamera2 doesn't need wait_recording; just sleep
+            time.sleep(1.0)
     finally:
         CAM.stop_recording()
         with state_lock:
             state["recording"] = False
             state["record_stop_target"] = None
-            state["mode"] = "idle"   # ensure UI resets to idle
+            state["mode"] = "idle"
         log("Recording stopped; closing camera.")
         CAM.close()
 
@@ -413,7 +498,6 @@ def worker_wittypi_loop():
             remain = _seconds_until(next_shutdown)
             if remain > SAFETY_MARGIN_SECONDS + 5:
                 stop_at = next_shutdown - timedelta(seconds=SAFETY_MARGIN_SECONDS)
-                # Cap maximum recording duration to 1 hour
                 max_stop_at = _now_local() + timedelta(seconds=3600)
                 if stop_at > max_stop_at:
                     stop_at = max_stop_at
@@ -421,7 +505,6 @@ def worker_wittypi_loop():
                     state["mode"] = "recording_wittypi"
                 record_stop_event.clear()
                 do_record_until(stop_at)
-                # loop to wait for next schedule again
                 continue
         time.sleep(CHECK_INTERVAL)
 
@@ -431,7 +514,6 @@ def worker_duration_once(seconds: int):
     stop_at = _now_local() + timedelta(seconds=seconds)
     record_stop_event.clear()
     do_record_until(stop_at)
-    # mode is reset to idle in do_record_until()
 
 # ------------- Web UI helpers -------------
 def format_bytes(n):
@@ -439,6 +521,8 @@ def format_bytes(n):
 
 def list_files_rows():
     rows = []
+    if not RECORDINGS_DIR.exists():
+        return ""
     for p in sorted(RECORDINGS_DIR.iterdir(), key=lambda x: x.stat().st_mtime if x.exists() else 0, reverse=True):
         if not p.is_file():
             continue
@@ -455,7 +539,8 @@ def config_table():
     kv = {
         "resolution": f"{CAMERA_CONFIG['resolution'][0]}x{CAMERA_CONFIG['resolution'][1]}",
         "framerate": CAMERA_CONFIG["framerate"],
-        "quality": f"{CAMERA_CONFIG['quality']}",
+        "bitrate": f"{int(CAMERA_CONFIG['bitrate']/1e6)} Mbps",
+        "quality (display only)": f"{CAMERA_CONFIG['quality']}",
         "label": CAMERA_CONFIG["annotation_label"],
         "file_extension": CAMERA_CONFIG["file_extension"],
         "mode": ("WittyPi (DURATION_SECONDS=None)" if (DURATION_SECONDS is None) else f"Fixed duration {DURATION_SECONDS}s"),
@@ -469,11 +554,8 @@ def config_table():
 
 def status_panel():
     with state_lock:
-        m = state["mode"]
-        rec = state["recording"]
-        preview = state["preview_on"]
-        stop_target = state["record_stop_target"]
-        last_err = state["last_error"]
+        m = state["mode"]; rec = state["recording"]; preview = state["preview_on"]
+        stop_target = state["record_stop_target"]; last_err = state["last_error"]
     rem = ""
     if stop_target:
         s = int(max(0, _seconds_until(stop_target)))
@@ -488,7 +570,6 @@ def status_panel():
 def datetime_html():
     now_str = _now_local().strftime("%Y-%m-%d %H:%M:%S %Z")
     return f"<h3>System Date & Time</h3><p>{now_str}</p>"
-
 
 def schedule_editor_html():
     sp = schedule_path()
@@ -507,7 +588,6 @@ def schedule_editor_html():
 
 # ------------- HTTP Server -------------
 class UIHandler(http.server.BaseHTTPRequestHandler):
-    # suppress default request logging
     def log_message(self, format, *args):
         return
 
@@ -585,8 +665,7 @@ Start duration (1..3600 s): <input name="seconds" size="8"/>
                 with target.open("rb") as f:
                     while True:
                         chunk = f.read(64*1024)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         self.wfile.write(chunk)
             except Exception as e:
                 self.send_error(500, f"Error sending file: {e}")
@@ -607,12 +686,10 @@ Start duration (1..3600 s): <input name="seconds" size="8"/>
             return
 
         if path == "/preview":
-            # Only when not recording
             with state_lock:
                 if state["recording"]:
                     self.send_error(409, "Preview unavailable while recording")
                     return
-            # Headers for multipart MJPEG
             self.send_response(200)
             self.send_header("Age", "0")
             self.send_header("Cache-Control", "no-cache, private")
@@ -712,15 +789,13 @@ def serve_http():
 
 def apply_low_power_settings():
     import subprocess
-
-    # --- Disable HDMI ---
+    # --- Disable HDMI (tvservice is deprecated; harmless if missing) ---
     try:
         subprocess.run(["/usr/bin/tvservice", "-o"], check=False)
         with open("/sys/class/graphics/fb0/blank", "w") as f:
             f.write("1")
     except Exception as e:
         log(f"HDMI disable failed: {e}")
-
     # --- Disable Bluetooth ---
     try:
         subprocess.run(["rfkill", "block", "bluetooth"], check=False)
@@ -728,12 +803,11 @@ def apply_low_power_settings():
     except Exception as e:
         log(f"Bluetooth disable failed: {e}")
 
-
 # ------------- Main -------------
 def main():
     apply_low_power_settings()
     RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    log("PICT recorder starting...")
+    log("PICT recorder (picamera2) starting...")
     threading.Thread(target=serve_http, daemon=True).start()
 
     if isinstance(DURATION_SECONDS, int) and 1 <= DURATION_SECONDS <= 3600:
@@ -751,6 +825,7 @@ def main():
 def _on_signal(signum, frame):
     stop_requested.set()
     record_stop_event.set()
+
 signal.signal(signal.SIGTERM, _on_signal)
 signal.signal(signal.SIGINT, _on_signal)
 
