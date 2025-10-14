@@ -160,7 +160,7 @@ def get_next_shutdown_from_wittypi():
     except Exception as e:
         log(f"runScript.sh error: {e}")
         return None
-    m = re.search(r"Next shutdown at:\s*([0-9-]+\s+[0-9:]+)", out)
+    m = re.search(r"next shutdown at:\s*([0-9-]+\s+[0-9:]+)", out)
     if not m:
         return None
     try:
@@ -183,8 +183,8 @@ def get_wittypi_next_times():
         log(f"runScript.sh error: {e}")
         return (None, None, None)
 
-    m_up  = re.search(r"Next startup at:\s*([0-9-]+\s+[0-9:]+)", out)
-    m_down= re.search(r"Next shutdown at:\s*([0-9-]+\s+[0-9:]+)", out)
+    m_up  = re.search(r"next startup at:\s*([0-9-]+\s+[0-9:]+)", out)
+    m_down= re.search(r"next shutdown at:\s*([0-9-]+\s+[0-9:]+)", out)
 
     to_dt = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M:%S").astimezone()
     try:
