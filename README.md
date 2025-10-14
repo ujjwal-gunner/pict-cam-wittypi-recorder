@@ -36,6 +36,7 @@ unzip pict-cam-wittypi-recorder.zip
 mv pict-cam-wittypi-recorder-main pict-cam-wittypi-recorder
 cd pict-cam-wittypi-recorder
 chmod +x install.sh
+sudo apt update
 bash install.sh
 ```
   
