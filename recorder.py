@@ -552,7 +552,7 @@ def worker_wittypi_loop():
             remain = _seconds_until(next_shutdown)
             if remain > SAFETY_MARGIN_SECONDS + 5:
                 stop_at = next_shutdown - timedelta(seconds=SAFETY_MARGIN_SECONDS)
-                max_stop_at = _now_local() + timedelta(seconds=3600)
+                max_stop_at = _now_local() + timedelta(seconds=1800)
                 if stop_at > max_stop_at:
                     stop_at = max_stop_at
                 with state_lock:
