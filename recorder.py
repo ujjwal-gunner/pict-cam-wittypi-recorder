@@ -43,7 +43,6 @@ CAMERA_CONFIG = {
     "resolution": (1296, 972),     # width, height (choose a mode your sensor supports well)
     "framerate": 15,               # FPS (we set FrameDurationLimits)
     "bitrate": 4_000_000,          # bits per second (single quality knob, used for H.264 encoder)
-    "quality": 22,                 # retained only for UI display
     "annotation_label": "PICT WittyPi Recorder",
     "file_extension": ".h264",     # raw H.264 (mp4 wrap optional via ffmpeg)
 }
@@ -60,11 +59,6 @@ SAFETY_MARGIN_SECONDS  = 60
 CHECK_INTERVAL         = 30
 WEB_PORT               = 8123
 
-RPICAM_STOP_CANDIDATES = [
-    ["/home/pi/RPi_Cam_Web_Interface/stop.sh"],
-    ["/var/www/html/RPi_Cam_Web_Interface/stop.sh"],
-]
-RPICAM_SERVICE_NAMES = ["raspimjpeg"]
 
 # ------------- Logging -------------
 LOG_PATH = RECORDINGS_DIR / "recorder.log"
@@ -135,19 +129,26 @@ def wrap_to_mp4(h264_file: Path):
     except Exception:
         log("ffmpeg not found (or slow); skipping mp4 wrap")
         return
+
+    fps = CAMERA_CONFIG["framerate"]
     mp4_file = h264_file.with_suffix(".mp4")
+
     try:
         subprocess.run([
             "ffmpeg", "-y",
-            "-framerate", str(CAMERA_CONFIG["framerate"]),
+            "-f", "h264",               # tell ffmpeg the input format
+            "-r", str(fps),             # <-- correct flag for raw h264
             "-i", str(h264_file),
             "-c:v", "copy",
+            "-movflags", "+faststart",
             str(mp4_file)
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
         log(f"Wrapped {h264_file.name} -> {mp4_file.name}")
         h264_file.unlink(missing_ok=True)
     except Exception as e:
         log(f"MP4 wrap failed: {e}")
+
 
 # ------------- Witty Pi -------------
 def get_next_shutdown_from_wittypi():
@@ -166,6 +167,46 @@ def get_next_shutdown_from_wittypi():
         return datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").astimezone()
     except Exception:
         return None
+
+def get_wittypi_next_times():
+    """
+    Returns (next_startup_dt, next_shutdown_dt, raw_output) or (None, None, None)
+    by parsing wittyPi/runScript.sh output.
+    """
+    runscript = _find_existing(RUNSCRIPT_CANDIDATES)
+    if not runscript:
+        return (None, None, None)
+    try:
+        out = subprocess.check_output(["bash", str(runscript)], stderr=subprocess.STDOUT)\
+                        .decode("utf-8", "ignore")
+    except Exception as e:
+        log(f"runScript.sh error: {e}")
+        return (None, None, None)
+
+    m_up  = re.search(r"Next startup at:\s*([0-9-]+\s+[0-9:]+)", out)
+    m_down= re.search(r"Next shutdown at:\s*([0-9-]+\s+[0-9:]+)", out)
+
+    to_dt = lambda s: datetime.strptime(s, "%Y-%m-%d %H:%M:%S").astimezone()
+    try:
+        ns = to_dt(m_up.group(1))   if m_up   else None
+        nd = to_dt(m_down.group(1)) if m_down else None
+    except Exception:
+        ns, nd = None, None
+    return (ns, nd, out)
+
+
+def wittypi_says_off_now():
+    """
+    Heuristic: if next startup < next shutdown, the present *scheduled* state is OFF (sleep).
+    That means a boot right now is likely manual (button press), so we should not record.
+    Returns True/False/None (None = unknown).
+    """
+    ns, nd, _ = get_wittypi_next_times()
+    if ns and nd:
+        return ns < nd
+    # Sometimes only one is present; be conservative (unknown)
+    return None
+
 
 def schedule_path():
     return _find_existing(SCHEDULE_FILE_CANDIDATES) or SCHEDULE_FILE_CANDIDATES[0]
@@ -202,20 +243,6 @@ def system_info_html():
 </table>
 """
 
-# ------------- RPi Cam Web Interface -------------
-def stop_rpi_cam_interface():
-    for cmd in RPICAM_STOP_CANDIDATES:
-        try:
-            if Path(cmd[0]).exists():
-                subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-    for name in RPICAM_SERVICE_NAMES:
-        try:
-            subprocess.run(["/usr/bin/pkill", "-f", name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-    log("RPi Cam Web Interface stop attempted (stop.sh/pkill).")
 
 # ------------- Camera Manager (picamera2) -------------
 class CameraManager:
@@ -368,13 +395,20 @@ class CameraManager:
         """
         class _FrameWriter:
             boundary = b"--FRAME\r\nContent-Type: image/jpeg\r\n\r\n"
-            def __init__(self, out): self.out = out
-            def write(self, b):
+            def __init__(self, out, stop_event):
+                self.out = out
+                self.stop_event = stop_event
+            def write_frame(self, jpeg_bytes):
                 try:
-                    self.out.write(self.boundary); self.out.write(b); self.out.write(b"\r\n")
+                    self.out.write(self.boundary)
+                    self.out.write(jpeg_bytes)
+                    self.out.write(b"\r\n")
+                    self.out.flush()
                 except Exception:
-                    pass
-            def flush(self): pass
+                    # client disconnected or socket broke
+                    try: self.stop_event.set()
+                    except Exception: pass
+                    raise
 
         if not self.open_with_retry(for_preview=True):
             try: wfile.write(b"")
@@ -393,11 +427,11 @@ class CameraManager:
         self.preview_stop.clear()
         log("Preview started")
 
-        writer = _FrameWriter(wfile)
+        writer = _FrameWriter(wfile, self.preview_stop)
 
         try:
             while not self.preview_stop.is_set():
-                # Build frame with overlay text
+                # Remaining time text
                 remaining = 0
                 with state_lock:
                     if state["record_stop_target"]:
@@ -417,11 +451,10 @@ class CameraManager:
                     im = self._draw_annotation(im, text)
                     out = BytesIO()
                     im.save(out, format="JPEG", quality=80)
-                    writer.write(out.getvalue())
+                    writer.write_frame(out.getvalue())
                 except Exception as e:
-                    log(f"Preview frame error: {e}")
-                    time.sleep(0.2)
-                    continue
+                    log(f"Preview frame/write error: {e}")
+                    break  # exit loop on client drop or capture issue
 
                 time.sleep(0.2)
         finally:
@@ -434,6 +467,7 @@ class CameraManager:
                 state["preview_on"] = False
             log("Preview stopped")
 
+
     def start_preview(self, wfile):
         t = threading.Thread(target=self._mjpeg_streamer, args=(wfile,), daemon=True)
         self.preview_thread = t
@@ -443,6 +477,12 @@ class CameraManager:
         self.preview_stop.set()
         if self.preview_thread and self.preview_thread.is_alive():
             self.preview_thread.join(timeout=2.0)
+        # Fully release the camera to avoid "busy" when starting a recording next
+        try:
+            self.close()
+        except Exception:
+            pass
+
 
 CAM = CameraManager()
 
@@ -453,13 +493,12 @@ def annotate(rem_s: int):
         f"{CAMERA_CONFIG['annotation_label']} ({HOSTNAME})\n"
         f"{_now_local().strftime('%Y-%m-%d %H:%M:%S')} | "
         f"{CAMERA_CONFIG['resolution'][0]}x{CAMERA_CONFIG['resolution'][1]} @ {CAMERA_CONFIG['framerate']}fps | "
-        f"Q={CAMERA_CONFIG['quality']} | rem {max(0, rem_s)}s"
+        f"rem {max(0, rem_s)}s"
     )
 
 def do_record_until(stop_at: datetime):
     out_path = build_output_path()
     log(f"Recording -> {out_path.name} (stop at {stop_at.isoformat()})")
-    stop_rpi_cam_interface()
     if not CAM.open_with_retry():
         log("Cannot open camera; aborting recording.")
         return
@@ -493,7 +532,22 @@ def worker_wittypi_loop():
     while not stop_requested.is_set():
         with state_lock:
             state["mode"] = "waiting"
-        next_shutdown = get_next_shutdown_from_wittypi()
+
+        # --- NEW: detect manual wake (outside ON window) ---
+        off_now = wittypi_says_off_now()
+        if off_now is True:
+            # We are awake but schedule says we should be sleeping => likely a manual wake for maintenance.
+            log("WittyPi: schedule=OFF now (manual wake detected). Not recording; sleeping...")
+            time.sleep(CHECK_INTERVAL)
+            continue
+        elif off_now is None:
+            # Unknown; fall through and try to compute a stop time as before
+            log("WittyPi: schedule state unknown (could not parse), proceeding cautiously.")
+
+        # --- Existing logic: record up to (next shutdown - margin), capped at 1h ---
+        ns, nd, _ = get_wittypi_next_times()
+        next_shutdown = nd
+
         if next_shutdown:
             remain = _seconds_until(next_shutdown)
             if remain > SAFETY_MARGIN_SECONDS + 5:
@@ -506,7 +560,9 @@ def worker_wittypi_loop():
                 record_stop_event.clear()
                 do_record_until(stop_at)
                 continue
+
         time.sleep(CHECK_INTERVAL)
+
 
 def worker_duration_once(seconds: int):
     with state_lock:
@@ -540,7 +596,6 @@ def config_table():
         "resolution": f"{CAMERA_CONFIG['resolution'][0]}x{CAMERA_CONFIG['resolution'][1]}",
         "framerate": CAMERA_CONFIG["framerate"],
         "bitrate": f"{int(CAMERA_CONFIG['bitrate']/1e6)} Mbps",
-        "quality (display only)": f"{CAMERA_CONFIG['quality']}",
         "label": CAMERA_CONFIG["annotation_label"],
         "file_extension": CAMERA_CONFIG["file_extension"],
         "mode": ("WittyPi (DURATION_SECONDS=None)" if (DURATION_SECONDS is None) else f"Fixed duration {DURATION_SECONDS}s"),
@@ -698,15 +753,13 @@ Start duration (1..3600 s): <input name="seconds" size="8"/>
             self.end_headers()
             try:
                 CAM.start_preview(self.wfile)
-                while True:
+                # stay alive only while the preview thread is alive
+                while CAM.preview_thread and CAM.preview_thread.is_alive():
                     time.sleep(0.25)
-            except BrokenPipeError:
-                pass
-            except Exception:
-                pass
             finally:
-                CAM.stop_preview()
+                CAM.stop_preview()  # safe even if already stopped
             return
+
 
         if path == "/schedule":
             html = f"<html><body>{schedule_editor_html()}<p><a href='/'>← Back</a></p></body></html>"
@@ -778,30 +831,20 @@ Start duration (1..3600 s): <input name="seconds" size="8"/>
         self.send_error(404, "Unknown POST")
 
 def serve_http():
-    class ReusableTCPServer(socketserver.TCPServer):
+    class ThreadedHTTPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
         allow_reuse_address = True
-    with ReusableTCPServer(("", WEB_PORT), UIHandler) as httpd:
+        daemon_threads = True  # auto-clean worker threads on client drop
+
+    with ThreadedHTTPServer(("", WEB_PORT), UIHandler) as httpd:
         log(f"HTTP server at http://0.0.0.0:{WEB_PORT}/ (serving {RECORDINGS_DIR})")
         try:
             httpd.serve_forever()
         except Exception as e:
             log(f"HTTP server stopped: {e}")
 
+
 def apply_low_power_settings():
-    import subprocess
-    # --- Disable HDMI (tvservice is deprecated; harmless if missing) ---
-    try:
-        subprocess.run(["/usr/bin/tvservice", "-o"], check=False)
-        with open("/sys/class/graphics/fb0/blank", "w") as f:
-            f.write("1")
-    except Exception as e:
-        log(f"HDMI disable failed: {e}")
-    # --- Disable Bluetooth ---
-    try:
-        subprocess.run(["rfkill", "block", "bluetooth"], check=False)
-        log("Bluetooth disabled")
-    except Exception as e:
-        log(f"Bluetooth disable failed: {e}")
+    pass
 
 # ------------- Main -------------
 def main():
