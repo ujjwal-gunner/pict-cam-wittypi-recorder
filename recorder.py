@@ -532,35 +532,22 @@ def worker_wittypi_loop():
     while not stop_requested.is_set():
         with state_lock:
             state["mode"] = "waiting"
-
-        # --- NEW: detect manual wake (outside ON window) ---
-        off_now = wittypi_says_off_now()
-        if off_now is True:
-            # We are awake but schedule says we should be sleeping => likely a manual wake for maintenance.
-            log("WittyPi: schedule=OFF now (manual wake detected). Not recording; sleeping...")
-            time.sleep(CHECK_INTERVAL)
-            continue
-        elif off_now is None:
-            # Unknown; fall through and try to compute a stop time as before
-            log("WittyPi: schedule state unknown (could not parse), proceeding cautiously.")
-
-        # --- Existing logic: record up to (next shutdown - margin), capped at 1h ---
-        ns, nd, _ = get_wittypi_next_times()
-        next_shutdown = nd
-
+        next_shutdown = get_next_shutdown_from_wittypi()
         if next_shutdown:
             remain = _seconds_until(next_shutdown)
             if remain > SAFETY_MARGIN_SECONDS + 5:
                 stop_at = next_shutdown - timedelta(seconds=SAFETY_MARGIN_SECONDS)
+                # Cap maximum recording duration to 1 hour
                 max_stop_at = _now_local() + timedelta(seconds=1800)
                 if stop_at > max_stop_at:
+                    continue
                     stop_at = max_stop_at
                 with state_lock:
                     state["mode"] = "recording_wittypi"
                 record_stop_event.clear()
                 do_record_until(stop_at)
+                # loop to wait for next schedule again
                 continue
-
         time.sleep(CHECK_INTERVAL)
 
 
